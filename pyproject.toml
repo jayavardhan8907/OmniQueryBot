@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omniquerybot"
+version = "0.1.0"
+description = "Telegram hybrid RAG and image caption bot built for local demos."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "fastapi>=0.116.0,<1.0.0",
+  "google-genai>=1.13.0,<2.0.0",
+  "numpy>=1.26.0,<3.0.0",
+  "Pillow>=10.0.0,<12.0.0",
+  "python-dotenv>=1.0.1,<2.0.0",
+  "python-multipart>=0.0.20,<1.0.0",
+  "python-telegram-bot>=22.0,<23.0",
+  "sentence-transformers>=3.0.0,<6.0.0",
+  "uvicorn>=0.35.0,<1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.28.0,<1.0.0",
+  "pytest>=8.3.0,<9.0.0",
+  "pytest-asyncio>=0.24.0,<1.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

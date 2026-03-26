@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OmniQueryBot Local Chat</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand-block">
+          <p class="eyebrow">Local GenAI Playground</p>
+          <h1>OmniQueryBot</h1>
+          <p class="lead">
+            Ask text questions, attach an image, and inspect retrieval without leaving one clean chat.
+          </p>
+        </div>
+
+        <button id="new-chat-button" class="primary-button sidebar-button" type="button">
+          New chat
+        </button>
+
+        <section class="panel">
+          <div class="panel-label">Runtime</div>
+          <div id="runtime-badges" class="badge-grid"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-label">Actions</div>
+          <button id="summarize-button" class="secondary-button sidebar-button" type="button">
+            Summarize last interaction
+          </button>
+          <button id="reindex-button" class="ghost-button sidebar-button" type="button">
+            Reindex knowledge base
+          </button>
+          <div id="action-status" class="action-status">
+            Ready.
+          </div>
+        </section>
+
+        <section class="panel sources-panel">
+          <div class="panel-label">Latest Retrieval</div>
+          <p class="panel-copy">
+            Retrieved chunks for the latest text question appear here.
+          </p>
+          <div id="source-list" class="source-list empty-state-copy">
+            Ask a question to inspect the matching chunks.
+          </div>
+        </section>
+      </aside>
+
+      <main class="main-shell">
+        <header class="hero">
+          <div>
+            <p class="eyebrow">Custom Local Frontend</p>
+            <h2>Chat With Your Local AI Stack</h2>
+            <p class="hero-copy">
+              Same backend logic as the assignment bot, but in a browser interface that feels closer to a proper chat product.
+            </p>
+          </div>
+        </header>
+
+        <section id="empty-state" class="empty-state">
+          <div class="empty-card">
+            <h3>Try a grounded question</h3>
+            <p>
+              Start with one of the sample prompts or attach an image using the composer below.
+            </p>
+            <div class="suggestions">
+              <button class="suggestion-chip" data-example="How do I create a Python virtual environment?" type="button">
+                How do I create a Python virtual environment?
+              </button>
+              <button class="suggestion-chip" data-example="What is the recommended Git branch flow?" type="button">
+                What is the recommended Git branch flow?
+              </button>
+              <button class="suggestion-chip" data-example="Why include Docker for this assignment?" type="button">
+                Why include Docker for this assignment?
+              </button>
+              <button class="suggestion-chip" data-example="What should happen when the generation API fails?" type="button">
+                What should happen when the generation API fails?
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <section id="chat-feed" class="chat-feed" aria-live="polite"></section>
+
+        <div class="composer-dock">
+          <div id="attachment-preview" class="attachment-preview hidden"></div>
+          <div class="composer-shell">
+            <button id="attach-button" class="composer-icon" type="button">
+              Attach image
+            </button>
+            <input id="image-input" type="file" accept="image/*" hidden />
+            <textarea
+              id="message-input"
+              rows="1"
+              placeholder="Ask about the local knowledge base, or attach an image..."
+            ></textarea>
+            <button id="send-button" class="composer-send" type="button">Send</button>
+          </div>
+          <p class="composer-note">
+            Text and image testing use the same conversation. If you attach an image, the caption response lands right in the chat.
+          </p>
+        </div>
+      </main>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
