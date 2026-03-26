@@ -1,8 +1,11 @@
 .venv/
 __pycache__/
 .pytest_cache/
+.pytest_tmp/
+pytest-cache-files-*/
 .mypy_cache/
 .ruff_cache/
+.vscode/
 *.pyc
 *.pyo
 *.pyd
@@ -14,3 +17,6 @@ build/
 htmlcov/
 .coverage
 data/uploads/
+data/*.log
+data/load_test_report*.json
+data/eval_report*.json

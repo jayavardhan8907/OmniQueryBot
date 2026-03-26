@@ -2,19 +2,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from io import BytesIO
 from pathlib import Path
 
-from PIL import Image, UnidentifiedImageError
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 from omniquery_bot.config import Settings
-from omniquery_bot.genai_client import GeminiClient, GenerationError
 from omniquery_bot.knowledge_base import KnowledgeBase
+from omniquery_bot.llm_service import GenerationError, ModelGateway
+from omniquery_bot.rag_service import RagService
+from omniquery_bot.vision_service import VisionService
 
 
 LOGGER = logging.getLogger(__name__)
+BOT_COMMANDS = [
+    BotCommand("help", "Show usage instructions"),
+    BotCommand("ask", "Start a knowledge-base question"),
+    BotCommand("image", "Upload an image for a caption and 3 tags"),
+]
 
 
 def run() -> None:
@@ -36,44 +41,56 @@ def run() -> None:
         stats["chunks_written"],
     )
 
-    gemini = GeminiClient(settings.gemini_api_key or "", settings.genai_model)
-    app = ApplicationBuilder().token(settings.telegram_bot_token).build()
+    models = ModelGateway(settings)
+    rag_service = RagService(settings, kb, models)
+    vision_service = VisionService(settings, kb, models)
+    async def post_init(application) -> None:
+        await application.bot.set_my_commands(BOT_COMMANDS)
+
+    app = ApplicationBuilder().token(settings.telegram_bot_token).post_init(post_init).build()
 
     async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.message is None:
             return
         await update.message.reply_text(help_text())
 
-    async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def answer_query(update: Update, query: str) -> None:
         if update.message is None or update.effective_user is None:
             return
 
-        query = " ".join(context.args).strip()
-        if not query:
-            await update.message.reply_text("Usage: /ask <your question>")
-            return
-
         try:
-            message = await asyncio.to_thread(
-                answer_query,
-                settings,
-                kb,
-                gemini,
-                str(update.effective_user.id),
-                query,
+            result = await asyncio.to_thread(rag_service.answer, str(update.effective_user.id), query)
+            await update.message.reply_text(
+                format_rag_message(result.reply, result.sources, settings),
             )
-            await update.message.reply_text(message)
         except GenerationError:
-            LOGGER.exception("Gemini failed during /ask")
+            LOGGER.exception("Generation failed during /ask")
             await update.message.reply_text("I hit a generation error while answering that question.")
         except Exception:
             LOGGER.exception("Unexpected failure during /ask")
             await update.message.reply_text("Something went wrong while processing your question.")
 
+    async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.message is None or update.effective_user is None:
+            return
+
+        query = " ".join(context.args).strip()
+        user_id = str(update.effective_user.id)
+        await asyncio.to_thread(kb.set_waiting_for_image, user_id, False)
+        if not query:
+            await asyncio.to_thread(kb.set_waiting_for_ask, user_id, True)
+            await update.message.reply_text("Send me your question and I will answer from the local knowledge base.")
+            return
+
+        await asyncio.to_thread(kb.set_waiting_for_ask, user_id, False)
+        await answer_query(update, query)
+
     async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.message is None or update.effective_user is None:
             return
-        await asyncio.to_thread(kb.set_waiting_for_image, str(update.effective_user.id), True)
+        user_id = str(update.effective_user.id)
+        await asyncio.to_thread(kb.set_waiting_for_ask, user_id, False)
+        await asyncio.to_thread(kb.set_waiting_for_image, user_id, True)
         await update.message.reply_text(
             "Send me a photo or image file and I will return a short caption plus 3 tags."
         )
@@ -83,14 +100,14 @@ def run() -> None:
             return
 
         attachment = None
-        image_name = None
+        image_name = "uploaded-image"
         mime_type = "image/jpeg"
 
         if update.message.photo:
             attachment = update.message.photo[-1]
         elif update.message.document and update.message.document.mime_type:
             attachment = update.message.document
-            image_name = update.message.document.file_name
+            image_name = update.message.document.file_name or image_name
             mime_type = update.message.document.mime_type
 
         if attachment is None:
@@ -100,58 +117,66 @@ def run() -> None:
         try:
             telegram_file = await attachment.get_file()
             image_bytes = bytes(await telegram_file.download_as_bytearray())
-            message = await asyncio.to_thread(
-                answer_image,
-                settings,
-                kb,
-                gemini,
+            result = await asyncio.to_thread(
+                vision_service.describe,
                 str(update.effective_user.id),
                 image_bytes,
                 mime_type,
                 image_name,
             )
-            await update.message.reply_text(message)
+            await update.message.reply_text(result.reply)
         except ValueError as error:
+            await asyncio.to_thread(kb.set_waiting_for_image, str(update.effective_user.id), False)
             await update.message.reply_text(str(error))
         except GenerationError:
-            LOGGER.exception("Gemini failed during image description")
-            await update.message.reply_text("I hit a generation error while describing that image.")
+            await asyncio.to_thread(kb.set_waiting_for_image, str(update.effective_user.id), False)
+            LOGGER.exception("Generation failed during image upload")
+            await update.message.reply_text(
+                "I hit a generation error while describing that image. Send /image and try again."
+            )
         except Exception:
+            await asyncio.to_thread(kb.set_waiting_for_image, str(update.effective_user.id), False)
             LOGGER.exception("Unexpected failure during image upload")
             await update.message.reply_text("Something went wrong while processing the image.")
-
-    async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-
-        try:
-            summary = await asyncio.to_thread(summarize_last, kb, gemini, str(update.effective_user.id))
-            if not summary:
-                await update.message.reply_text("I do not have a previous answer or image result to summarize yet.")
-                return
-            await update.message.reply_text(summary)
-        except GenerationError:
-            LOGGER.exception("Gemini failed during /summarize")
-            await update.message.reply_text("I hit a generation error while summarizing the last interaction.")
-        except Exception:
-            LOGGER.exception("Unexpected failure during /summarize")
-            await update.message.reply_text("Something went wrong while generating the summary.")
 
     async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.message is None or update.effective_user is None:
             return
-        state = await asyncio.to_thread(kb.user_state, str(update.effective_user.id))
-        if state["waiting_for_image"]:
+        user_id = str(update.effective_user.id)
+        waiting_for_image = await asyncio.to_thread(kb.is_waiting_for_image, user_id)
+        if waiting_for_image:
             message = "I am waiting for an image. Upload a photo or image file to continue."
+            await update.message.reply_text(message)
+            return
+
+        waiting_for_ask = await asyncio.to_thread(kb.is_waiting_for_ask, user_id)
+        if waiting_for_ask:
+            await asyncio.to_thread(kb.set_waiting_for_ask, user_id, False)
+            query = (update.message.text or "").strip()
+            if not query:
+                await update.message.reply_text("Send me your question after /ask.")
+                return
+            await answer_query(update, query)
+            return
+
+        if update.message.text and update.message.text.strip():
+            message = "Use /ask to start a question, or /image to upload an image."
         else:
-            message = "Use /ask <query> for text questions or /image to start an image description."
+            message = "Use /ask to start a question, or /image to upload an image."
         await update.message.reply_text(message)
+
+    async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.message is None:
+            return
+        await update.message.reply_text(
+            "Unknown command. Use /help, /ask, or /image."
+        )
 
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("ask", ask_command))
     app.add_handler(CommandHandler("image", image_command))
-    app.add_handler(CommandHandler("summarize", summarize_command))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_upload))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text))
     app.run_polling(drop_pending_updates=True)
 
@@ -160,116 +185,12 @@ def help_text() -> str:
     return (
         "OmniQueryBot commands:\n"
         "/help - Show usage instructions.\n"
-        "/ask <query> - Ask a question against the local knowledge base.\n"
-        "/image - Upload an image for a caption and 3 tags.\n"
-        "/summarize - Summarize your last bot interaction."
+        "/ask - Start a knowledge-base question. You can also use /ask <query> directly.\n"
+        "/image - Upload an image and get 1 caption plus 3 tags.\n\n"
+        "Scope:\n"
+        "- /ask answers only from the local knowledge base.\n"
+        "- /image returns the assignment-required caption and 3 tags."
     )
-
-
-def answer_query(
-    settings: Settings,
-    kb: KnowledgeBase,
-    gemini: GeminiClient,
-    user_id: str,
-    query: str,
-) -> str:
-    sources = kb.search(query)
-    if sources:
-        history = kb.recent_turns(user_id, settings.history_window)
-        answer_text = gemini.answer_with_context(query, sources, history)
-    else:
-        answer_text = "I couldn't find that in the knowledge base."
-
-    kb.add_turn(
-        user_id=user_id,
-        kind="ask",
-        user_input=query,
-        bot_output=answer_text,
-        metadata={"sources": sources},
-    )
-    kb.save_artifact(
-        user_id=user_id,
-        artifact_type="ask",
-        payload={"query": query, "answer": answer_text, "sources": sources},
-    )
-    return format_rag_message(answer_text, sources, settings)
-
-
-def answer_image(
-    settings: Settings,
-    kb: KnowledgeBase,
-    gemini: GeminiClient,
-    user_id: str,
-    image_bytes: bytes,
-    mime_type: str,
-    image_name: str | None,
-) -> str:
-    normalized_bytes = normalize_image(image_bytes, settings.image_max_edge)
-    result = gemini.describe_image(normalized_bytes, "image/jpeg")
-    message = format_image_message(result)
-    kb.add_turn(
-        user_id=user_id,
-        kind="image",
-        user_input=image_name or "[image upload]",
-        bot_output=message,
-        metadata={"mime_type": mime_type, **result},
-    )
-    kb.save_artifact(
-        user_id=user_id,
-        artifact_type="image",
-        payload={"name": image_name or "uploaded image", **result},
-    )
-    return message
-
-
-def summarize_last(kb: KnowledgeBase, gemini: GeminiClient, user_id: str) -> str | None:
-    state = kb.user_state(user_id)
-    artifact_type = state["last_artifact_type"]
-    payload = state["last_artifact_payload"]
-    if not artifact_type or not payload:
-        return None
-
-    if artifact_type == "ask":
-        artifact_text = (
-            f"Question: {payload.get('query', '')}\n"
-            f"Answer: {payload.get('answer', '')}\n"
-            f"Sources: {format_source_names(payload.get('sources', []))}"
-        )
-    else:
-        artifact_text = (
-            f"Image name: {payload.get('name', '')}\n"
-            f"Caption: {payload.get('caption', '')}\n"
-            f"Tags: {', '.join(payload.get('tags', []))}"
-        )
-
-    summary = gemini.summarize(artifact_type, artifact_text)
-    kb.add_turn(
-        user_id=user_id,
-        kind="summary",
-        user_input=f"summarize {artifact_type}",
-        bot_output=summary,
-        metadata={"artifact_type": artifact_type},
-    )
-    return summary
-
-
-def format_source_names(sources: list[dict]) -> str:
-    return ", ".join(
-        f"{source.get('document_path', '')} / {source.get('heading', '')}"
-        for source in sources
-    )
-
-
-def normalize_image(image_bytes: bytes, max_edge: int) -> bytes:
-    try:
-        with Image.open(BytesIO(image_bytes)) as image:
-            rgb_image = image.convert("RGB")
-            rgb_image.thumbnail((max_edge, max_edge))
-            buffer = BytesIO()
-            rgb_image.save(buffer, format="JPEG", quality=90)
-            return buffer.getvalue()
-    except (UnidentifiedImageError, OSError) as error:
-        raise ValueError("The uploaded file is not a valid image.") from error
 
 
 def format_rag_message(answer_text: str, sources: list[dict], settings: Settings) -> str:
@@ -278,17 +199,10 @@ def format_rag_message(answer_text: str, sources: list[dict], settings: Settings
         lines.append("")
         lines.append("Sources:")
         for source in sources[: settings.source_snippet_count]:
-            source_name = Path(source["document_path"]).name
-            snippet = " ".join(source["text"].split())
-            if len(snippet) > settings.source_snippet_length:
-                snippet = f"{snippet[:settings.source_snippet_length].rstrip()}..."
-            lines.append(f"- {source_name} / {source['heading']}: {snippet}")
+            document_path = str(source["document_path"]).replace("\\", "/")
+            lines.append(f"- {document_path} | {source['heading']}")
 
     message = "\n".join(lines).strip()
     if len(message) > 3900:
         message = f"{message[:3897].rstrip()}..."
     return message
-
-
-def format_image_message(result: dict) -> str:
-    return f"Caption: {result['caption']}\nTags: {', '.join(result['tags'])}"

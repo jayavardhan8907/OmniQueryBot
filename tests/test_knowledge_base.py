@@ -42,7 +42,12 @@ def make_settings(tmp_path: Path, kb_dir: Path) -> Settings:
         project_root=tmp_path,
         telegram_bot_token="token",
         gemini_api_key="key",
-        genai_model="gemini-2.5-flash",
+        text_provider="ollama",
+        vision_provider="ollama",
+        ollama_base_url="http://localhost:11434",
+        text_model="qwen3.5:4b",
+        vision_model="qwen3.5:4b",
+        gemini_model="gemini-2.5-flash",
         embedding_model="fake",
         db_path=tmp_path / "omniquerybot.db",
         kb_dir=kb_dir,
@@ -53,6 +58,7 @@ def make_settings(tmp_path: Path, kb_dir: Path) -> Settings:
         chunk_overlap=100,
         source_snippet_count=2,
         source_snippet_length=180,
+        rag_max_output_tokens=1024,
         image_max_edge=1600,
         log_level="INFO",
     )
@@ -97,3 +103,30 @@ def test_search_reuses_cached_query_embedding(tmp_path: Path) -> None:
     assert second
     assert kb.query_calls == 1
     assert first[0]["document_path"].endswith("python.md")
+
+
+def test_recent_turns_store_json_payload(tmp_path: Path) -> None:
+    kb_dir = tmp_path / "knowledge_base"
+    kb_dir.mkdir()
+    settings = make_settings(tmp_path, kb_dir)
+    kb = FakeKnowledgeBase(settings)
+    kb.setup()
+
+    kb.add_turn(
+        "user-1",
+        "ask",
+        {
+            "mode": "rag",
+            "user_message": "How do I create a virtual environment?",
+            "rewritten_query": "How do I create a Python virtual environment?",
+            "assistant_message": "Use `py -3.11 -m venv .venv`.",
+            "sources": [{"document_path": "data/knowledge_base/python.md"}],
+        },
+    )
+
+    turns = kb.recent_turns("user-1", 3)
+
+    assert len(turns) == 1
+    assert turns[0]["user_message"].startswith("How do I create")
+    assert turns[0]["rewritten_query"].startswith("How do I create a Python")
+    assert turns[0]["assistant_message"].startswith("Use `py -3.11")

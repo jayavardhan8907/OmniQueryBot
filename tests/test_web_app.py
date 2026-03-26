@@ -8,6 +8,8 @@ from PIL import Image
 
 from omniquery_bot.config import Settings
 from omniquery_bot.knowledge_base import KnowledgeBase
+from omniquery_bot.rag_service import RagService
+from omniquery_bot.vision_service import VisionService
 from omniquery_bot.web_app import create_app
 
 
@@ -27,18 +29,43 @@ class FakeKnowledgeBase(KnowledgeBase):
         return [0.0, 0.0, 1.0]
 
 
-class FakeGemini:
-    def answer_with_context(self, query, sources, history):
-        return "Use `py -3.11 -m venv .venv` to create the environment."
+class FakeResponse:
+    def __init__(self, content: str) -> None:
+        self.content = content
 
-    def describe_image(self, image_bytes, mime_type):
-        return {
-            "caption": "A plain blue square on a light background.",
-            "tags": ["blue", "square", "minimal"],
-        }
 
-    def summarize(self, artifact_type, artifact_text):
-        return f"Summary for {artifact_type}: {artifact_text[:48]}"
+class FakeStructuredModel:
+    def __init__(self, schema) -> None:
+        self.schema = schema
+
+    def invoke(self, messages, **kwargs):
+        prompt = "\n".join(str(message.content) for message in messages)
+        if "hello" in prompt.lower():
+            return self.schema(route="greeting", standalone_query="", reply="Hello! Ask about the docs or send an image.")
+        return self.schema(
+            route="rag",
+            standalone_query="How do I create a Python virtual environment?",
+            reply="",
+        )
+
+
+class FakeGateway:
+    def structured_chat_model(self, schema, temperature: float = 0.0):
+        return FakeStructuredModel(schema)
+
+    def chat_model(self, temperature: float = 0.2, *, reasoning="low", num_predict=None):
+        return FakeResponseModel()
+
+    def describe_image(self, image_bytes, mime_type, schema, instruction):
+        return schema(
+            caption="A plain blue square on a light background.",
+            tags=["blue", "square", "minimal"],
+        )
+
+
+class FakeResponseModel:
+    def invoke(self, messages, **kwargs):
+        return FakeResponse("Use `py -3.11 -m venv .venv` to create the environment.")
 
 
 def make_settings(tmp_path: Path, kb_dir: Path) -> Settings:
@@ -46,7 +73,12 @@ def make_settings(tmp_path: Path, kb_dir: Path) -> Settings:
         project_root=tmp_path,
         telegram_bot_token="token",
         gemini_api_key="key",
-        genai_model="gemini-2.5-flash",
+        text_provider="ollama",
+        vision_provider="ollama",
+        ollama_base_url="http://localhost:11434",
+        text_model="qwen3.5:4b",
+        vision_model="qwen3.5:4b",
+        gemini_model="gemini-2.5-flash",
         embedding_model="fake",
         db_path=tmp_path / "omniquerybot.db",
         kb_dir=kb_dir,
@@ -57,6 +89,7 @@ def make_settings(tmp_path: Path, kb_dir: Path) -> Settings:
         chunk_overlap=100,
         source_snippet_count=2,
         source_snippet_length=180,
+        rag_max_output_tokens=1024,
         image_max_edge=1600,
         log_level="INFO",
     )
@@ -73,7 +106,10 @@ def make_client(tmp_path: Path) -> TestClient:
     kb = FakeKnowledgeBase(settings)
     kb.setup()
     kb.reindex()
-    app = create_app(settings=settings, kb=kb, gemini=FakeGemini())
+    models = FakeGateway()
+    rag_service = RagService(settings, kb, models)
+    vision_service = VisionService(settings, kb, models)
+    app = create_app(settings=settings, kb=kb, rag_service=rag_service, vision_service=vision_service)
     return TestClient(app)
 
 
@@ -88,6 +124,7 @@ def test_chat_endpoint_returns_reply_and_sources(tmp_path: Path) -> None:
     assert response.status_code == 200
     payload = response.json()
     assert "create the environment" in payload["reply"]
+    assert payload["route"] == "rag"
     assert len(payload["sources"]) >= 1
 
 
@@ -109,14 +146,27 @@ def test_image_endpoint_returns_caption_and_tags(tmp_path: Path) -> None:
     assert payload["tags"] == ["blue", "square", "minimal"]
 
 
-def test_summarize_endpoint_uses_last_artifact(tmp_path: Path) -> None:
+def test_history_endpoint_returns_chat_messages(tmp_path: Path) -> None:
     client = make_client(tmp_path)
     client.post(
         "/api/chat",
         json={"session_id": "local-test", "message": "How do I create a Python virtual environment?"},
     )
 
-    response = client.post("/api/summarize", json={"session_id": "local-test"})
+    response = client.get("/api/history", params={"session_id": "local-test"})
 
     assert response.status_code == 200
-    assert response.json()["reply"].startswith("Summary for ask:")
+    payload = response.json()
+    assert payload["messages"][0]["role"] == "user"
+    assert payload["messages"][1]["role"] == "assistant"
+
+
+def test_config_endpoint_returns_runtime_config(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+
+    response = client.get("/api/config")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["text_model"] == "qwen3.5:4b"
+    assert payload["embedding_model"] == "fake"

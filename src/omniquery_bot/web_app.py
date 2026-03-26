@@ -11,10 +11,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
-from omniquery_bot.bot import format_image_message, normalize_image, summarize_last
 from omniquery_bot.config import Settings
-from omniquery_bot.genai_client import GeminiClient, GenerationError
 from omniquery_bot.knowledge_base import KnowledgeBase
+from omniquery_bot.llm_service import GenerationError, ModelGateway
+from omniquery_bot.rag_service import RagService
+from omniquery_bot.vision_service import VisionService
 
 
 LOGGER = logging.getLogger(__name__)
@@ -26,14 +27,11 @@ class ChatRequest(BaseModel):
     message: str
 
 
-class SessionRequest(BaseModel):
-    session_id: str
-
-
 def create_app(
     settings: Settings | None = None,
     kb: KnowledgeBase | None = None,
-    gemini: GeminiClient | None = None,
+    rag_service: RagService | None = None,
+    vision_service: VisionService | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     settings.validate_for_web()
@@ -50,12 +48,14 @@ def create_app(
             stats["chunks_written"],
         )
 
-    gemini = gemini or GeminiClient(settings.gemini_api_key or "", settings.genai_model)
+    models = ModelGateway(settings)
+    rag_service = rag_service or RagService(settings, kb, models)
+    vision_service = vision_service or VisionService(settings, kb, models)
 
     if not WEB_DIR.exists():
         raise FileNotFoundError(f"Missing local web assets directory: {WEB_DIR}")
 
-    app = FastAPI(title="OmniQueryBot Local Web", version="0.1.0")
+    app = FastAPI(title="OmniQueryBot Local Chat", version="0.2.0")
     app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
     @app.get("/")
@@ -69,7 +69,9 @@ def create_app(
     @app.get("/api/config")
     async def config() -> dict:
         return {
-            "model": settings.genai_model,
+            "text_model": settings.text_model,
+            "vision_model": settings.vision_model,
+            "embedding_model": settings.embedding_model,
             "knowledge_base": str(settings.kb_dir),
             "top_k": settings.top_k,
             "history_window": settings.history_window,
@@ -78,6 +80,7 @@ def create_app(
     @app.get("/api/history")
     async def history(session_id: str) -> dict:
         normalized_session = _normalize_session_id(session_id)
+        LOGGER.info("API history request | session_id=%s", normalized_session)
         turns = await run_in_threadpool(kb.recent_turns, normalized_session, 12)
         messages: list[dict] = []
         for turn in turns:
@@ -85,14 +88,15 @@ def create_app(
                 {
                     "role": "user",
                     "kind": turn["kind"],
-                    "content": turn["user_input"],
+                    "content": turn.get("user_message", ""),
                 }
             )
             messages.append(
                 {
                     "role": "assistant",
                     "kind": turn["kind"],
-                    "content": turn["bot_output"],
+                    "content": turn.get("assistant_message", ""),
+                    "tags": turn.get("tags", []),
                 }
             )
         return {"messages": messages}
@@ -103,9 +107,10 @@ def create_app(
         message = payload.message.strip()
         if not message:
             raise HTTPException(status_code=400, detail="Message is required.")
+        LOGGER.info("API chat request | session_id=%s | message=%s", session_id, message)
 
         try:
-            return await run_in_threadpool(_chat_response, settings, kb, gemini, session_id, message)
+            result = await run_in_threadpool(rag_service.answer, session_id, message)
         except GenerationError as error:
             LOGGER.exception("Generation failed during local chat request")
             raise HTTPException(status_code=502, detail=f"Generation error: {error}") from error
@@ -115,16 +120,34 @@ def create_app(
             LOGGER.exception("Unexpected local chat failure")
             raise HTTPException(status_code=500, detail="Unexpected server error.") from error
 
+        LOGGER.info(
+            "API chat response | session_id=%s | route=%s | rewritten_query=%s | source_count=%s | reply=%s",
+            session_id,
+            result.route,
+            result.rewritten_query,
+            len(result.sources),
+            result.reply,
+        )
+        return {
+            "reply": result.reply,
+            "route": result.route,
+            "rewritten_query": result.rewritten_query,
+            "sources": [_serialize_source(source, settings.source_snippet_length) for source in result.sources],
+        }
+
     @app.post("/api/image")
     async def image(session_id: str = Form(...), file: UploadFile = File(...)) -> dict:
         normalized_session = _normalize_session_id(session_id)
+        LOGGER.info(
+            "API image request | session_id=%s | file_name=%s | mime_type=%s",
+            normalized_session,
+            file.filename or "uploaded-image",
+            file.content_type or "application/octet-stream",
+        )
         try:
             image_bytes = await file.read()
-            return await run_in_threadpool(
-                _image_response,
-                settings,
-                kb,
-                gemini,
+            result = await run_in_threadpool(
+                vision_service.describe,
                 normalized_session,
                 image_bytes,
                 file.content_type or "application/octet-stream",
@@ -139,29 +162,28 @@ def create_app(
             LOGGER.exception("Unexpected local image failure")
             raise HTTPException(status_code=500, detail="Unexpected server error.") from error
 
-    @app.post("/api/summarize")
-    async def summarize(payload: SessionRequest) -> dict:
-        session_id = _normalize_session_id(payload.session_id)
-        try:
-            summary = await run_in_threadpool(summarize_last, kb, gemini, session_id)
-        except GenerationError as error:
-            LOGGER.exception("Generation failed during local summarize request")
-            raise HTTPException(status_code=502, detail=f"Generation error: {error}") from error
-        except Exception as error:  # pragma: no cover - defensive API guard
-            LOGGER.exception("Unexpected local summarize failure")
-            raise HTTPException(status_code=500, detail="Unexpected server error.") from error
-
-        if not summary:
-            return {"reply": "No previous answer or image result is available yet."}
-        return {"reply": summary}
+        LOGGER.info(
+            "API image response | session_id=%s | caption=%s | tags=%s",
+            normalized_session,
+            result.caption,
+            result.tags,
+        )
+        return {
+            "reply": result.reply,
+            "caption": result.caption,
+            "tags": result.tags,
+            "file_name": file.filename or "uploaded-image",
+        }
 
     @app.post("/api/reindex")
     async def reindex() -> dict:
+        LOGGER.info("API reindex request")
         try:
             stats = await run_in_threadpool(kb.reindex)
         except Exception as error:  # pragma: no cover - defensive API guard
             LOGGER.exception("Unexpected reindex failure")
             raise HTTPException(status_code=500, detail="Unexpected server error.") from error
+        LOGGER.info("API reindex response | stats=%s", stats)
         return {"stats": stats}
 
     return app
@@ -179,79 +201,12 @@ def run() -> None:
     uvicorn.run(create_app(settings=settings), host=host, port=port, log_level=settings.log_level.lower())
 
 
-def _chat_response(
-    settings: Settings,
-    kb: KnowledgeBase,
-    gemini: GeminiClient,
-    session_id: str,
-    message: str,
-) -> dict:
-    matches = kb.search(message)
-    if matches:
-        history = kb.recent_turns(session_id, settings.history_window)
-        reply = gemini.answer_with_context(message, matches, history)
-    else:
-        reply = "I couldn't find that in the knowledge base."
-
-    kb.add_turn(
-        user_id=session_id,
-        kind="ask",
-        user_input=message,
-        bot_output=reply,
-        metadata={"sources": matches},
-    )
-    kb.save_artifact(
-        user_id=session_id,
-        artifact_type="ask",
-        payload={"query": message, "answer": reply, "sources": matches},
-    )
-    return {
-        "reply": reply,
-        "sources": [_serialize_source(match, settings.source_snippet_length) for match in matches],
-    }
-
-
-def _image_response(
-    settings: Settings,
-    kb: KnowledgeBase,
-    gemini: GeminiClient,
-    session_id: str,
-    image_bytes: bytes,
-    mime_type: str,
-    file_name: str,
-) -> dict:
-    if not image_bytes:
-        raise ValueError("Upload an image first.")
-
-    normalized_bytes = normalize_image(image_bytes, settings.image_max_edge)
-    result = gemini.describe_image(normalized_bytes, "image/jpeg")
-    reply = format_image_message(result)
-
-    kb.add_turn(
-        user_id=session_id,
-        kind="image",
-        user_input=file_name,
-        bot_output=reply,
-        metadata={"mime_type": mime_type, **result},
-    )
-    kb.save_artifact(
-        user_id=session_id,
-        artifact_type="image",
-        payload={"name": file_name, **result},
-    )
-    return {
-        "reply": reply,
-        "caption": result["caption"],
-        "tags": result["tags"],
-        "file_name": file_name,
-    }
-
-
 def _serialize_source(source: dict, snippet_length: int) -> dict:
     snippet = " ".join(source["text"].split())
     if len(snippet) > snippet_length:
         snippet = f"{snippet[:snippet_length].rstrip()}..."
     return {
+        "chunk_id": source["chunk_id"],
         "file_name": Path(source["document_path"]).name,
         "document_path": source["document_path"],
         "heading": source["heading"],
